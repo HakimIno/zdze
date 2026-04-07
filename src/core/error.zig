@@ -9,4 +9,5 @@ pub const Error = error{
     InvalidData,
     WriteFailed,
     GenericError,
+    InternalError,
 };

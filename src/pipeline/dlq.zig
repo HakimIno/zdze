@@ -27,19 +27,19 @@ pub const Dlq = struct {
     }
 
     pub fn save(self: *Dlq, event: types.CdcEvent, err_msg: []const u8) !void {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var out = std.io.Writer.Allocating.init(self.allocator);
+        defer out.deinit();
 
-        try std.json.stringify(.{
+        try std.json.Stringify.value(.{
             .timestamp = event.timestamp,
             .op = @tagName(event.op),
             .table = event.table,
             .schema = event.schema,
             .@"error" = err_msg,
-        }, .{}, buf.writer());
+        }, .{}, &out.writer);
         
-        try buf.append('\n');
-        try self.file.writeAll(buf.items);
+        try out.writer.writeByte('\n');
+        try self.file.writeAll(out.written());
         try self.file.sync();
         
         std.log.warn("Event moved to DLQ: {s}.{s} (Error: {s})", .{event.schema, event.table, err_msg});

@@ -7,6 +7,7 @@ const net = std.net;
 pub const KafkaSink = struct {
     allocator: std.mem.Allocator,
     brokers: []const u8,
+    write_buf: [4096]u8 = undefined,
     topic: []const u8,
     stream: ?net.Stream = null,
     correlation_id: i32 = 0,
@@ -31,7 +32,7 @@ pub const KafkaSink = struct {
         if (self.stream) |_| return;
         
         // Parse "host:port"
-        var it = std.mem.split(u8, self.brokers, ":");
+        var it = std.mem.splitScalar(u8, self.brokers, ':');
         const host = it.next() orelse return error.InvalidBrokerFormat;
         const port_str = it.next() orelse "9092";
         const port = try std.fmt.parseInt(u16, port_str, 10);
@@ -55,19 +56,20 @@ pub const KafkaSink = struct {
         }
 
         const stream = self.stream.?;
-        const writer = stream.writer();
+        var stream_writer = stream.writer(&self.write_buf);
 
         // 1. Serialize Event to JSON for value
-        var val_buf = std.ArrayList(u8).init(self.allocator);
-        defer val_buf.deinit();
+        var val_out = std.io.Writer.Allocating.init(self.allocator);
+        defer val_out.deinit();
         
         // Simplified JSON for Kafka value
-        std.json.stringify(.{
+        try std.json.Stringify.value(.{
             .op = @tagName(event.op),
             .table = event.table,
             .schema = event.schema,
             .ts = event.timestamp,
-        }, .{}, val_buf.writer()) catch return core_err.Error.InternalError;
+        }, .{}, &val_out.writer);
+        const val_bytes = val_out.written();
 
         // 2. Build Kafka Produce Request (Minimal v0)
         // [RequestSize][ApiKey][ApiVer][CorrId][ClientIdLen][ClientId][Acks][Timeout][TopicCount][TopicNameLen][TopicName][PartCount][Partition][MsgSetSize][Offset][MsgSize][CRC][Magic][Attr][KeyLen][ValLen][Val]
@@ -76,58 +78,55 @@ pub const KafkaSink = struct {
         const topic = self.topic;
         
         // Message Payload
-        var msg_payload = std.ArrayList(u8).init(self.allocator);
-        defer msg_payload.deinit();
-        const msg_writer = msg_payload.writer();
+        var msg_out = std.io.Writer.Allocating.init(self.allocator);
+        defer msg_out.deinit();
         
-        try msg_writer.writeByte(0); // Magic
-        try msg_writer.writeByte(0); // Attributes
-        try msg_writer.writeInt(i32, -1, .big); // Key Length (-1 = null)
-        try msg_writer.writeInt(i32, @intCast(val_buf.items.len), .big); // Val Length
-        try msg_writer.writeAll(val_buf.items);
+        try msg_out.writer.writeByte(0); // Magic
+        try msg_out.writer.writeByte(0); // Attributes
+        try msg_out.writer.writeInt(i32, -1, .big); // Key Length (-1 = null)
+        try msg_out.writer.writeInt(i32, @intCast(val_bytes.len), .big); // Val Length
+        try msg_out.writer.writeAll(val_bytes);
         
-        const crc = std.hash.Crc32.hash(msg_payload.items);
+        const crc = std.hash.Crc32.hash(msg_out.written());
         
         // Entire Request Buffer
-        var req_buf = std.ArrayList(u8).init(self.allocator);
-        defer req_buf.deinit();
-        const req_writer = req_buf.writer();
+        var req_out = std.io.Writer.Allocating.init(self.allocator);
+        defer req_out.deinit();
         
         // Header
-        try req_writer.writeInt(i16, 0, .big); // API Key: Produce
-        try req_writer.writeInt(i16, 0, .big); // API version
-        try req_writer.writeInt(i32, self.correlation_id, .big);
+        try req_out.writer.writeInt(i16, 0, .big); // API Key: Produce
+        try req_out.writer.writeInt(i16, 0, .big); // API version
+        try req_out.writer.writeInt(i32, self.correlation_id, .big);
         self.correlation_id += 1;
         
-        try req_writer.writeInt(i16, @intCast(client_id.len), .big);
-        try req_writer.writeAll(client_id);
+        try req_out.writer.writeInt(i16, @intCast(client_id.len), .big);
+        try req_out.writer.writeAll(client_id);
         
         // Produce Body
-        try req_writer.writeInt(i16, 1, .big); // Required Acks
-        try req_writer.writeInt(i32, 1000, .big); // Timeout
-        try req_writer.writeInt(i32, 1, .big); // Topic Count
+        try req_out.writer.writeInt(i16, 1, .big); // Required Acks
+        try req_out.writer.writeInt(i32, 1000, .big); // Timeout
+        try req_out.writer.writeInt(i32, 1, .big); // Topic Count
         
-        try req_writer.writeInt(i16, @intCast(topic.len), .big);
-        try req_writer.writeAll(topic);
+        try req_out.writer.writeInt(i16, @intCast(topic.len), .big);
+        try req_out.writer.writeAll(topic);
         
-        try req_writer.writeInt(i32, 1, .big); // Partition Count
-        try req_writer.writeInt(i32, 0, .big); // Partition 0
+        try req_out.writer.writeInt(i32, 1, .big); // Partition Count
+        try req_out.writer.writeInt(i32, 0, .big); // Partition 0
         
         // MessageSet
-        const msg_set_size = 8 + 4 + 4 + msg_payload.items.len; // Offset + Size + CRC + Payload
-        try req_writer.writeInt(i32, @intCast(msg_set_size), .big);
-        try req_writer.writeInt(i64, 0, .big); // Offset (0 for Produce)
-        try req_writer.writeInt(i32, @intCast(4 + msg_payload.items.len), .big); // Message Size
-        try req_writer.writeInt(u32, crc, .big);
-        try req_writer.writeAll(msg_payload.items);
+        const msg_set_size = 8 + 4 + 4 + msg_out.written().len; // Offset + Size + CRC + Payload
+        try req_out.writer.writeInt(i32, @intCast(msg_set_size), .big);
+        try req_out.writer.writeInt(i64, 0, .big); // Offset (0 for Produce)
+        try req_out.writer.writeInt(i32, @intCast(4 + msg_out.written().len), .big); // Message Size
+        try req_out.writer.writeInt(u32, crc, .big);
+        try req_out.writer.writeAll(msg_out.written());
 
-        // Final Write
-        try writer.writeInt(i32, @intCast(req_buf.items.len), .big);
-        try writer.writeAll(req_buf.items);
+        // Final Write to Stream
+        const final_req = req_out.written();
+        try stream_writer.interface.writeInt(i32, @intCast(final_req.len), .big);
+        try stream_writer.interface.writeAll(final_req);
         
-        // Note: In production we should read response to verify Acks, 
-        // but for this phase we focus on the outgoing Native Binary Protocol.
-        std.log.debug("KafkaSink: [topic={s}] Sent binary ProduceRequest ({d} bytes)", .{topic, req_buf.items.len});
+        std.log.debug("KafkaSink: [topic={s}] Sent binary ProduceRequest ({d} bytes)", .{topic, final_req.len});
     }
 
     pub fn sink(self: *KafkaSink) core.Sink {

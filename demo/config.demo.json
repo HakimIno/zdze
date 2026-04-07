@@ -1,0 +1,29 @@
+{
+  "source": {
+    "type": "postgres",
+    "postgres": {
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "database": "zdze_demo",
+      "password": "password",
+      "slot_name": "zdze_demo_slot",
+      "ssl": false,
+      "snapshot_tables": ["users", "orders"]
+    }
+  },
+  "sink": {
+    "type": "kafka",
+    "kafka_brokers": "localhost:19092",
+    "kafka_topic": "cdc_events"
+  },
+  "filters": {
+    "include_tables": ["users", "orders"]
+  },
+  "transformations": [
+    { "table": "users", "column": "password", "action": "drop" },
+    { "table": "users", "column": "email", "action": "mask" }
+  ],
+  "state_path": "demo_state.bin",
+  "dlq_path": "demo_dlq.jsonl"
+}

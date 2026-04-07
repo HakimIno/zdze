@@ -36,6 +36,7 @@ pub const PostgresSource = struct {
         password: ?[]const u8 = null,
         slot_name: []const u8 = "zdze_slot",
         ssl: bool = false,
+        snapshot_tables: ?[][]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config, persistence: ?@import("../../core/persistence.zig").Persistence) !*PostgresSource {
@@ -96,7 +97,7 @@ pub const PostgresSource = struct {
         try self.stream.writeAll(&buf);
 
         var resp: [1]u8 = undefined;
-        try self.stream.reader().readNoEof(&resp);
+        _ = try self.stream.read(&resp);
 
         if (resp[0] == 'S') {
             std.log.info("Postgres SSL: Handshake accepted. TLS upgrade would happen here.", .{});
@@ -155,11 +156,28 @@ pub const PostgresSource = struct {
             .authentication_request => {
                 var auth_type_buf: [4]u8 = undefined;
                 try reader.readSliceAll(&auth_type_buf);
-                const auth_type: proto.AuthType = @enumFromInt(std.mem.readInt(i32, &auth_type_buf, .big));
+                const auth_type_val = std.mem.readInt(i32, &auth_type_buf, .big);
                 
-                switch (auth_type) {
-                    .ok => self.authenticated = true,
-                    else => return error.UnsupportedAuthMethod,
+                if (auth_type_val == 0) {
+                    self.authenticated = true;
+                    return;
+                }
+
+                // Handle Password Challenges
+                if (auth_type_val == 3) {
+                    // Cleartext
+                    try self.sendPasswordMessage(self.config.password orelse "", null);
+                } else if (auth_type_val == 5) {
+                    // MD5
+                    var salt: [4]u8 = undefined;
+                    try reader.readSliceAll(&salt);
+                    try self.sendPasswordMessage(self.config.password orelse "", &salt);
+                } else if (auth_type_val == 10) {
+                    std.log.err("Postgres requested SASL (SCRAM-SHA-256). Please use MD5 or trust for this demo.", .{});
+                    return error.UnsupportedAuthMethod;
+                } else {
+                    std.log.err("Postgres requested unknown auth type: {d}", .{auth_type_val});
+                    return error.UnsupportedAuthMethod;
                 }
             },
             .ready_for_query => {
@@ -168,15 +186,50 @@ pub const PostgresSource = struct {
                 self.ready = true;
             },
             .error_response => {
-                // For now, just skip the error details and fail
                 try reader.discardAll(payload_len);
                 return error.PostgresError;
             },
             else => {
-                // Skip other messages like ParameterStatus, BackendKeyData
                 try reader.discardAll(payload_len);
             },
         }
+    }
+
+    fn sendPasswordMessage(self: *PostgresSource, password: []const u8, salt: ?*[4]u8) !void {
+        var resp_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&resp_buf);
+        const writer = fbs.writer();
+
+        try writer.writeByte('p');
+        try writer.writeInt(i32, 0, .big); // Length placeholder
+
+        if (salt) |s| {
+            // MD5: md5(hex(md5(pw + user)) + salt)
+            var h1 = std.crypto.hash.Md5.init(.{});
+            h1.update(password);
+            h1.update(self.config.user);
+            var d1: [16]u8 = undefined;
+            h1.final(&d1);
+
+            const hex1 = std.fmt.bytesToHex(d1, .lower);
+
+            var h2 = std.crypto.hash.Md5.init(.{});
+            h2.update(&hex1);
+            h2.update(s);
+            var d2: [16]u8 = undefined;
+            h2.final(&d2);
+
+            try writer.writeAll("md5");
+            try writer.writeAll(&std.fmt.bytesToHex(d2, .lower));
+            try writer.writeByte(0);
+        } else {
+            try writer.writeAll(password);
+            try writer.writeByte(0);
+        }
+
+        const end_pos = try fbs.getPos();
+        std.mem.writeInt(i32, resp_buf[1..5], @intCast(end_pos - 1), .big);
+        try self.stream.writeAll(resp_buf[0..end_pos]);
     }
 
     fn startReplication(self: *PostgresSource, config: Config) !void {
@@ -259,7 +312,8 @@ pub const PostgresSource = struct {
     }
 
     fn runSnapshot(self: *PostgresSource) !?types.CdcEvent {
-        const tables = self.config.snapshot_tables orelse &.{"users"}; // Default for now
+        const default_tables: []const []const u8 = &.{"users"};
+        const tables = self.config.snapshot_tables orelse default_tables;
         
         if (self.snapshot_table_idx >= tables.len) {
             self.mode = .streaming;

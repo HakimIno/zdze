@@ -11,7 +11,7 @@ pub const HttpServer = struct {
     thread: ?std.Thread = null,
     
     // History buffer for charts (last 60 seconds)
-    history: std.fifo.LinearFifo(MetricPoint, .Dynamic),
+    history: std.array_list.Managed(MetricPoint),
     mutex: std.Thread.Mutex = .{},
 
     pub const MetricPoint = struct {
@@ -25,7 +25,7 @@ pub const HttpServer = struct {
             .allocator = allocator,
             .engine = e,
             .port = port,
-            .history = std.fifo.LinearFifo(MetricPoint, .Dynamic).init(allocator),
+            .history = std.array_list.Managed(MetricPoint).init(allocator),
         };
         return self;
     }
@@ -50,10 +50,10 @@ pub const HttpServer = struct {
             const rate = if (duration > 0) @as(f64, @floatFromInt(metrics.processed_count)) / @as(f64, @floatFromInt(duration)) else 0;
 
             self.mutex.lock();
-            if (self.history.readableLength() >= 60) {
-                _ = self.history.readItem();
+            if (self.history.items.len >= 60) {
+                _ = self.history.orderedRemove(0);
             }
-            self.history.writeItem(.{ .ts = now, .rate = rate }) catch {};
+            self.history.append(.{ .ts = now, .rate = rate }) catch {};
             self.mutex.unlock();
         }
     }
@@ -80,7 +80,10 @@ pub const HttpServer = struct {
             defer conn.stream.close();
 
             var read_buffer: [1024 * 8]u8 = undefined;
-            var server_http = http.Server.init(conn, &read_buffer);
+            var write_buffer: [1024]u8 = undefined;
+            var reader = conn.stream.reader(&read_buffer);
+            var writer = conn.stream.writer(&write_buffer);
+            var server_http = http.Server.init(&reader.file_reader.interface, &writer.interface);
             
             var request = server_http.receiveHead() catch continue;
             
@@ -97,21 +100,20 @@ pub const HttpServer = struct {
     }
 
     fn handleHistory(self: *HttpServer, request: *http.Server.Request) !void {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var out = std.io.Writer.Allocating.init(self.allocator);
+        defer out.deinit();
 
-        try buf.append('[');
+        try out.writer.writeByte('[');
         self.mutex.lock();
-        const items = self.history.readableSlice(0);
+        const items = self.history.items;
         for (items, 0..) |item, i| {
-            try std.json.stringify(item, .{}, buf.writer());
-            if (i < items.len - 1) try buf.append(',');
+            try std.json.Stringify.value(item, .{}, &out.writer);
+            if (i < items.len - 1) try out.writer.writeByte(',');
         }
         self.mutex.unlock();
-        try buf.append(']');
-
-        try request.respond(buf.items, .{
-            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        try out.writer.writeByte(']');
+        try request.respond(out.written(), .{
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
         });
     }
 

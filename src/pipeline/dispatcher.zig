@@ -10,7 +10,7 @@ pub const Dispatcher = struct {
     sink: core.Sink,
     dlq: ?*dlq.Dlq = null,
     persistence: ?persistence.Persistence = null,
-    queue: std.fifo.LinearFifo(types.CdcEvent, .Dynamic),
+    queue: std.array_list.Managed(types.CdcEvent),
     mutex: std.Thread.Mutex = .{},
     not_empty: std.Thread.Condition = .{},
     not_full: std.Thread.Condition = .{},
@@ -25,7 +25,7 @@ pub const Dispatcher = struct {
             .sink = sink,
             .dlq = dlq_ptr,
             .persistence = p_state,
-            .queue = std.fifo.LinearFifo(types.CdcEvent, .Dynamic).init(allocator),
+            .queue = std.array_list.Managed(types.CdcEvent).init(allocator),
             .max_size = max_size,
         };
         return self;
@@ -49,7 +49,7 @@ pub const Dispatcher = struct {
     pub fn deinit(self: *Dispatcher) void {
         self.stop();
         // Clean up remaining events in queue
-        while (self.queue.readItem()) |*ev| {
+        for (self.queue.items) |*ev| {
             ev.deinit(self.allocator);
         }
         self.queue.deinit();
@@ -60,30 +60,30 @@ pub const Dispatcher = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        while (self.queue.readableLength() >= self.max_size and self.running) {
+        while (self.queue.items.len >= self.max_size and self.running) {
             // Backpressure: wait until there is space
             self.not_full.wait(&self.mutex);
         }
 
         if (!self.running) return error.DispatcherStopped;
 
-        try self.queue.writeItem(event);
+        try self.queue.append(event);
         self.not_empty.signal();
     }
 
     fn runConsumer(self: *Dispatcher) void {
         while (true) {
             self.mutex.lock();
-            while (self.queue.readableLength() == 0 and self.running) {
+            while (self.queue.items.len == 0 and self.running) {
                 self.not_empty.wait(&self.mutex);
             }
 
-            if (!self.running and self.queue.readableLength() == 0) {
+            if (!self.running and self.queue.items.len == 0) {
                 self.mutex.unlock();
                 break;
             }
-
-            var event = self.queue.readItem().?;
+            
+            var event = self.queue.orderedRemove(0);
             self.not_full.signal();
             self.mutex.unlock();
 

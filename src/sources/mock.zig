@@ -42,6 +42,7 @@ pub const MockSource = struct {
             .schema = self.allocator.dupe(u8, "public") catch return core_err.Error.OutOfMemory,
             .rows = row,
             .timestamp = std.time.microTimestamp(),
+            .lsn = 0,
         };
 
         self.count += 1;

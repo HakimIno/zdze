@@ -22,7 +22,7 @@ pub const Transformer = struct {
     pub fn transform(self: *Transformer, event: *types.CdcEvent) !void {
         const configs = self.configs orelse return;
 
-        var new_rows = std.ArrayList(types.Column).init(self.allocator);
+        var new_rows = std.array_list.Managed(types.Column).init(self.allocator);
         errdefer new_rows.deinit();
 
         for (event.rows) |col| {

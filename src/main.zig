@@ -103,11 +103,11 @@ pub fn main() !void {
     _engine_ptr = engine;
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handleSigInt },
-        .mask = std.posix.empty_sigset,
+        .mask = 0,
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null) catch {};
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null) catch {};
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 
     std.log.info("Engine components initialized. Starting replication loop...", .{});
     try engine.run();
