@@ -3,11 +3,13 @@ const core = @import("../core/interface.zig");
 const types = @import("../core/types.zig");
 const core_err = @import("../core/error.zig");
 const dlq = @import("dlq.zig");
+const persistence = @import("../core/persistence.zig");
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
     sink: core.Sink,
     dlq: ?*dlq.Dlq = null,
+    persistence: ?persistence.Persistence = null,
     queue: std.fifo.LinearFifo(types.CdcEvent, .Dynamic),
     mutex: std.Thread.Mutex = .{},
     not_empty: std.Thread.Condition = .{},
@@ -16,12 +18,13 @@ pub const Dispatcher = struct {
     running: bool = false,
     thread: ?std.Thread = null,
 
-    pub fn init(allocator: std.mem.Allocator, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, max_size: usize) !*Dispatcher {
+    pub fn init(allocator: std.mem.Allocator, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, p_state: ?persistence.Persistence, max_size: usize) !*Dispatcher {
         const self = try allocator.create(Dispatcher);
         self.* = .{
             .allocator = allocator,
             .sink = sink,
             .dlq = dlq_ptr,
+            .persistence = p_state,
             .queue = std.fifo.LinearFifo(types.CdcEvent, .Dynamic).init(allocator),
             .max_size = max_size,
         };
@@ -94,6 +97,15 @@ pub const Dispatcher = struct {
                 }
             };
 
+            // Transactional Save LSN
+            if (self.persistence) |p| {
+                if (event.lsn > 0) {
+                    p.save(.{ .last_lsn = event.lsn, .updated_at = std.time.microTimestamp() }) catch |p_err| {
+                        std.log.err("Dispatcher: Failed to save persistence state: {s}", .{@errorName(p_err)});
+                    };
+                }
+            }
+
             // Cleanup event after emission
             event.deinit(self.allocator);
         }
@@ -129,7 +141,7 @@ const MockSink = struct {
 test "Dispatcher: basic processing" {
     const allocator = std.testing.allocator;
     var mock = MockSink{};
-    const d = try Dispatcher.init(allocator, mock.sink(), null, 100);
+    const d = try Dispatcher.init(allocator, mock.sink(), null, null, 100);
     defer d.deinit();
 
     try d.start();
@@ -142,6 +154,7 @@ test "Dispatcher: basic processing" {
             .schema = try allocator.dupe(u8, "public"),
             .rows = try allocator.alloc(types.Column, 0),
             .timestamp = 0,
+            .lsn = 0,
         });
     }
 
@@ -157,7 +170,7 @@ test "Dispatcher: basic processing" {
 test "Dispatcher: backpressure" {
     const allocator = std.testing.allocator;
     var mock = MockSink{ .delay_ms = 50 }; // Slow sink
-    const d = try Dispatcher.init(allocator, mock.sink(), null, 2); // Small queue
+    const d = try Dispatcher.init(allocator, mock.sink(), null, null, 2); // Small queue
     defer d.deinit();
 
     try d.start();
@@ -172,6 +185,7 @@ test "Dispatcher: backpressure" {
             .schema = try allocator.dupe(u8, "public"),
             .rows = try allocator.alloc(types.Column, 0),
             .timestamp = 0,
+            .lsn = 0,
         });
     }
     

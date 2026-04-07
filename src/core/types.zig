@@ -29,6 +29,7 @@ pub const CdcEvent = struct {
     schema: []const u8,
     rows: []const Column,
     timestamp: i64,
+    lsn: u64,
 
     pub fn deinit(self: *CdcEvent, allocator: std.mem.Allocator) void {
         for (self.rows) |col| {

@@ -22,7 +22,7 @@ pub const Engine = struct {
         start_time: i64 = 0,
     } = .{},
 
-    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, cfg: ?config.Config.FilterConfig) !*Engine {
+    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, p_state: ?@import("../core/persistence.zig").Persistence, cfg: ?config.Config.FilterConfig) !*Engine {
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
@@ -32,8 +32,8 @@ pub const Engine = struct {
             .filter = filter.Filter.init(cfg),
         };
 
-        // Initialize Dispatcher (default max_size 10,000)
-        self.dispatcher = try dispatcher.Dispatcher.init(allocator, sink, dlq_ptr, 10000);
+        // Initialize Dispatcher with persistence for transactional LSN
+        self.dispatcher = try dispatcher.Dispatcher.init(allocator, sink, dlq_ptr, p_state, 10000);
         return self;
     }
 

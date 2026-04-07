@@ -17,6 +17,10 @@ pub const PostgresSource = struct {
     retry_count: u32 = 0,
     read_buf: [4096]u8 = undefined,
     write_buf: [4096]u8 = undefined,
+    mode: enum { snapshot, streaming } = .streaming,
+    snapshot_done: bool = false,
+    snapshot_table_idx: usize = 0,
+    snapshot_col_names: ?[][]const u8 = null,
 
     pub const RelationInfo = struct {
         name: []const u8,
@@ -52,6 +56,10 @@ pub const PostgresSource = struct {
             if (p.load()) |state| {
                 self.last_lsn = state.last_lsn;
             } else |_| {}
+        }
+
+        if (self.last_lsn == 0) {
+            self.mode = .snapshot;
         }
 
         if (config.ssl) {
@@ -247,8 +255,101 @@ pub const PostgresSource = struct {
         std.mem.writeInt(u64, buf[30..38], @intCast((now - pg_epoch) * 1000), .big);
         
         buf[38] = 0; // Reply requested: no
-        
         try self.stream.writeAll(buf[0..39]);
+    }
+
+    fn runSnapshot(self: *PostgresSource) !?types.CdcEvent {
+        const tables = self.config.snapshot_tables orelse &.{"users"}; // Default for now
+        
+        if (self.snapshot_table_idx >= tables.len) {
+            self.mode = .streaming;
+            std.log.info("Snapshot complete. Transitioning to Streaming mode.", .{});
+            return null;
+        }
+
+        const table_name = tables[self.snapshot_table_idx];
+        
+        if (self.snapshot_col_names == null) {
+            // 1. Send SELECT query
+            var query_buf: [256]u8 = undefined;
+            const query = try std.fmt.bufPrint(&query_buf, "SELECT * FROM {s}", .{table_name});
+            
+            var header: [5]u8 = undefined;
+            header[0] = @intFromEnum(proto.MsgType.query);
+            std.mem.writeInt(i32, header[1..5], @intCast(query.len + 4), .big);
+            
+            try self.stream.writeAll(&header);
+            try self.stream.writeAll(query);
+            std.log.info("Starting snapshot for table: {s}", .{table_name});
+        }
+
+        // 2. Read next message from query response
+        while (true) {
+            var r = self.stream.reader(&self.read_buf);
+            const reader = (&r).interface();
+            var header: [5]u8 = undefined;
+            reader.readSliceAll(&header) catch return null;
+
+            const msg_type: proto.MsgType = @enumFromInt(header[0]);
+            const msg_len = std.mem.readInt(i32, header[1..5], .big);
+            const payload_len: usize = @intCast(msg_len - 4);
+
+            switch (msg_type) {
+                .row_description => {
+                    const num_fields = try self.readInt(u16);
+                    var names = try self.allocator.alloc([]const u8, num_fields);
+                    for (0..num_fields) |i| {
+                        names[i] = try self.readString(self.allocator);
+                        try reader.discardAll(18); // Table OID, Col index, Type OID, Size, Modifier, Format code
+                    }
+                    self.snapshot_col_names = names;
+                    continue; // Next message (DataRow)
+                },
+                .data_row => {
+                    const num_fields = try self.readInt(u16);
+                    const cols = try self.allocator.alloc(types.Column, num_fields);
+                    const names = self.snapshot_col_names.?;
+                    
+                    for (0..num_fields) |i| {
+                        const len = try self.readInt(i32);
+                        if (len == -1) {
+                            cols[i] = .{ .name = try self.allocator.dupe(u8, names[i]), .value = .null };
+                        } else {
+                            const val = try self.allocator.alloc(u8, @intCast(len));
+                            try reader.readSliceAll(val);
+                            cols[i] = .{ .name = try self.allocator.dupe(u8, names[i]), .value = .{ .string = val } };
+                        }
+                    }
+
+                    return types.CdcEvent{
+                        .op = .insert,
+                        .table = try self.allocator.dupe(u8, table_name),
+                        .schema = try self.allocator.dupe(u8, "public"),
+                        .rows = cols,
+                        .timestamp = std.time.microTimestamp(),
+                        .lsn = 0, // Snapshot events have LSN 0
+                    };
+                },
+                .command_complete, .ready_for_query => {
+                    if (self.snapshot_col_names) |names| {
+                        for (names) |n| self.allocator.free(n);
+                        self.allocator.free(names);
+                        self.snapshot_col_names = null;
+                    }
+                    if (msg_type == .command_complete) {
+                        try reader.discardAll(payload_len);
+                        self.snapshot_table_idx += 1;
+                        return try self.runSnapshot();
+                    } else {
+                        continue;
+                    }
+                },
+                else => {
+                    try reader.discardAll(payload_len);
+                    continue;
+                }
+            }
+        }
     }
 
     fn readString(self: *PostgresSource, allocator: std.mem.Allocator) ![]const u8 {
@@ -268,6 +369,12 @@ pub const PostgresSource = struct {
 
     pub fn next(ptr: *anyopaque) core_err.Error!?types.CdcEvent {
         const self: *PostgresSource = @ptrCast(@alignCast(ptr));
+        if (self.mode == .snapshot) {
+            return self.runSnapshot() catch |err| {
+                std.log.err("Snapshot error: {s}", .{@errorName(err)});
+                return null;
+            };
+        }
         while (true) {
             return nextInternal(ptr) catch |err| {
                 switch (err) {
@@ -332,16 +439,12 @@ pub const PostgresSource = struct {
                             _ = try self.readInt(u32); // XID
                         },
                         .commit => {
-                            var flags_buf: [1]u8 = undefined;
-                            try reader.readSliceAll(&flags_buf); // Flags
+                            _ = try self.readInt(i64); // Flags
                             _ = try self.readInt(u64); // Commit LSN
-                            const end_lsn = try self.readInt(u64); // End LSN
+                            _ = try self.readInt(u64); // End LSN
                             _ = try self.readInt(u64); // Timestamp
                             
-                            // Checkpointing
-                            if (self.persistence) |p| {
-                                p.save(.{ .last_lsn = end_lsn, .updated_at = std.time.microTimestamp() }) catch {};
-                            }
+                            // Checkpointing moved to Dispatcher for Exactly-Once
                         },
                         .relation => {
                             const rel_id = try self.readInt(u32);
@@ -379,6 +482,7 @@ pub const PostgresSource = struct {
                                 .schema = try self.allocator.dupe(u8, rel_info.schema),
                                 .rows = rows,
                                 .timestamp = std.time.microTimestamp(),
+                                .lsn = self.last_lsn,
                             };
                         },
                         .update => {
@@ -409,6 +513,7 @@ pub const PostgresSource = struct {
                                 .schema = try self.allocator.dupe(u8, rel_info.schema),
                                 .rows = rows,
                                 .timestamp = std.time.microTimestamp(),
+                                .lsn = self.last_lsn,
                             };
                         },
                         .delete => {
@@ -427,6 +532,7 @@ pub const PostgresSource = struct {
                                 .schema = try self.allocator.dupe(u8, rel_info.schema),
                                 .rows = rows,
                                 .timestamp = std.time.microTimestamp(),
+                                .lsn = self.last_lsn,
                             };
                         },
                         else => {

@@ -87,7 +87,16 @@ pub const Config = struct {
             .password = if (p.password) |pw| try allocator.dupe(u8, pw) else null,
             .slot_name = try allocator.dupe(u8, p.slot_name),
             .ssl = p.ssl,
+            .snapshot_tables = if (p.snapshot_tables) |st| try dupeTables(allocator, st) else null,
         };
+    }
+
+    fn dupeTables(allocator: std.mem.Allocator, tables: [][]const u8) ![][]const u8 {
+        const result = try allocator.alloc([]const u8, tables.len);
+        for (tables, 0..) |t, i| {
+            result[i] = try allocator.dupe(u8, t);
+        }
+        return result;
     }
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
@@ -102,6 +111,10 @@ pub const Config = struct {
             allocator.free(p.database);
             if (p.password) |pw| allocator.free(pw);
             allocator.free(p.slot_name);
+            if (p.snapshot_tables) |st| {
+                for (st) |t| allocator.free(t);
+                allocator.free(st);
+            }
         }
         if (self.filters) |f| {
             if (f.include_tables) |it| {
