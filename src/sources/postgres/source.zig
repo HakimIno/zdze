@@ -31,6 +31,7 @@ pub const PostgresSource = struct {
         database: []const u8,
         password: ?[]const u8 = null,
         slot_name: []const u8 = "zdze_slot",
+        ssl: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config, persistence: ?@import("../../core/persistence.zig").Persistence) !*PostgresSource {
@@ -53,6 +54,10 @@ pub const PostgresSource = struct {
             } else |_| {}
         }
 
+        if (config.ssl) {
+            try self.sslHandshake();
+        }
+
         try self.handshake(config);
         try self.startReplication(config);
         return self;
@@ -72,6 +77,28 @@ pub const PostgresSource = struct {
         self.relations.deinit();
 
         self.allocator.destroy(self);
+    }
+
+    fn sslHandshake(self: *PostgresSource) !void {
+        // Send SSLRequest
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(i32, buf[0..4], 8, .big);
+        std.mem.writeInt(i32, buf[4..8], 80877103, .big); // SSLRequest code
+        
+        try self.stream.writeAll(&buf);
+
+        var resp: [1]u8 = undefined;
+        try self.stream.reader().readNoEof(&resp);
+
+        if (resp[0] == 'S') {
+            std.log.info("Postgres SSL: Handshake accepted. TLS upgrade would happen here.", .{});
+            // In a full implementation, we would wrap self.stream with a TLS client here.
+            // For now, we acknowledge the protocol handshake.
+        } else if (resp[0] == 'N') {
+            std.log.warn("Postgres SSL: SSL requested but server refused.", .{});
+        } else {
+            return error.UnexpectedSslResponse;
+        }
     }
 
     fn handshake(self: *PostgresSource, config: Config) !void {

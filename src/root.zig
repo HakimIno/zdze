@@ -14,9 +14,11 @@ pub const sources = struct {
 pub const sinks = struct {
     pub const stdout = @import("sinks/stdout_sink.zig");
     pub const webhook = @import("sinks/webhook_sink.zig");
+    pub const kafka_sink = @import("sinks/kafka_sink.zig");
 };
 
 pub const pipeline = struct {
     pub const engine = @import("pipeline/engine.zig");
     pub const filter = @import("pipeline/filter.zig");
+    pub const dispatcher = @import("pipeline/dispatcher.zig");
 };

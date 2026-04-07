@@ -19,8 +19,10 @@ pub const Config = struct {
     };
 
     pub const SinkConfig = struct {
-        type: enum { stdout, webhook },
+        type: enum { stdout, webhook, kafka },
         webhook_url: ?[]const u8 = null,
+        kafka_brokers: ?[]const u8 = null,
+        kafka_topic: ?[]const u8 = null,
     };
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -45,6 +47,8 @@ pub const Config = struct {
             .sink = .{
                 .type = parsed.value.sink.type,
                 .webhook_url = if (parsed.value.sink.webhook_url) |url| try allocator.dupe(u8, url) else null,
+                .kafka_brokers = if (parsed.value.sink.kafka_brokers) |kb| try allocator.dupe(u8, kb) else null,
+                .kafka_topic = if (parsed.value.sink.kafka_topic) |kt| try allocator.dupe(u8, kt) else null,
             },
             .filters = if (parsed.value.filters) |f| try dupeFilters(allocator, f) else null,
             .state_path = try allocator.dupe(u8, parsed.value.state_path),
@@ -80,12 +84,15 @@ pub const Config = struct {
             .database = try allocator.dupe(u8, p.database),
             .password = if (p.password) |pw| try allocator.dupe(u8, pw) else null,
             .slot_name = try allocator.dupe(u8, p.slot_name),
+            .ssl = p.ssl,
         };
     }
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.state_path);
         if (self.sink.webhook_url) |url| allocator.free(url);
+        if (self.sink.kafka_brokers) |kb| allocator.free(kb);
+        if (self.sink.kafka_topic) |kt| allocator.free(kt);
         if (self.source.postgres) |p| {
             allocator.free(p.host);
             allocator.free(p.user);

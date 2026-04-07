@@ -4,11 +4,13 @@ const types = @import("../core/types.zig");
 const core_err = @import("../core/error.zig");
 const filter = @import("filter.zig");
 const config = @import("../core/config.zig");
+const dispatcher = @import("dispatcher.zig");
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     source: core.Source,
     sink: core.Sink,
+    dispatcher: ?*dispatcher.Dispatcher = null,
     filter: filter.Filter,
     running: bool = false,
     
@@ -26,26 +28,38 @@ pub const Engine = struct {
             .sink = sink,
             .filter = filter.Filter.init(cfg),
         };
+
+        // Initialize Dispatcher (default max_size 10,000)
+        self.dispatcher = try dispatcher.Dispatcher.init(allocator, sink, 10000);
         return self;
     }
 
     pub fn run(self: *Engine) !void {
+        if (self.dispatcher) |d| try d.start();
         self.running = true;
         std.log.info("Engine started", .{});
 
         while (self.running) {
-            var event = self.source.next() catch |err| {
+            const event = self.source.next() catch |err| {
                 std.log.err("Source error: {s}", .{@errorName(err)});
                 return err;
             };
 
-            if (event) |*ev| {
-                defer ev.deinit(self.allocator);
-                
-                if (self.filter.shouldPass(ev)) {
-                    try self.sink.emit(ev.*);
+            if (event) |ev| {
+                if (self.filter.shouldPass(&ev)) {
+                    // Dispatch event asynchronously
+                    if (self.dispatcher) |d| {
+                        try d.push(ev);
+                        // ev ownership transferred to dispatcher
+                    } else {
+                        var ev_copy = ev;
+                        try self.sink.emit(ev_copy);
+                        ev_copy.deinit(self.allocator);
+                    }
                     self.metrics.processed_count += 1;
                 } else {
+                    var ev_mut = ev;
+                    ev_mut.deinit(self.allocator);
                     self.metrics.skipped_count += 1;
                 }
                 
@@ -78,6 +92,11 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         self.logMetrics();
+        if (self.dispatcher) |d| {
+            d.deinit();
+        } else {
+            self.sink.deinit();
+        }
         self.allocator.destroy(self);
     }
 };

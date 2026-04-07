@@ -54,6 +54,18 @@ pub fn main() !void {
                 return error.MissingWebhookConfig;
             }
         },
+        .kafka => {
+            if (cfg.sink.kafka_brokers) |kb| {
+                if (cfg.sink.kafka_topic) |kt| {
+                    const kafka = try root.sinks.kafka_sink.KafkaSink.init(allocator, kb, kt);
+                    sink_ptr = kafka.sink();
+                } else {
+                    return error.MissingKafkaTopic;
+                }
+            } else {
+                return error.MissingKafkaBrokers;
+            }
+        },
     }
     defer sink_ptr.deinit();
 
