@@ -88,7 +88,7 @@ pub fn main() !void {
         sink_ptr,
         dlq_ptr,
         persistence,
-        cfg.filters,
+        cfg,
     );
     defer engine.deinit();
 

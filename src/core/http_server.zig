@@ -9,6 +9,15 @@ pub const HttpServer = struct {
     port: u16 = 8080,
     running: bool = false,
     thread: ?std.Thread = null,
+    
+    // History buffer for charts (last 60 seconds)
+    history: std.fifo.LinearFifo(MetricPoint, .Dynamic),
+    mutex: std.Thread.Mutex = .{},
+
+    pub const MetricPoint = struct {
+        ts: i64,
+        rate: f64,
+    };
 
     pub fn init(allocator: std.mem.Allocator, e: *engine.Engine, port: u16) !*HttpServer {
         const self = try allocator.create(HttpServer);
@@ -16,6 +25,7 @@ pub const HttpServer = struct {
             .allocator = allocator,
             .engine = e,
             .port = port,
+            .history = std.fifo.LinearFifo(MetricPoint, .Dynamic).init(allocator),
         };
         return self;
     }
@@ -23,7 +33,29 @@ pub const HttpServer = struct {
     pub fn start(self: *HttpServer) !void {
         self.running = true;
         self.thread = try std.Thread.spawn(.{}, runServer, .{self});
-        std.log.info("HTTP Dashboard available at http://localhost:{d}", .{self.port});
+        
+        // Metrics collection thread
+        _ = try std.Thread.spawn(.{}, collectMetrics, .{self});
+        
+        std.log.info("Elite Dashboard available at http://localhost:{d}", .{self.port});
+    }
+
+    fn collectMetrics(self: *HttpServer) !void {
+        while (self.running) {
+            std.Thread.sleep(1 * std.time.ns_per_s);
+            
+            const metrics = self.engine.metrics;
+            const now = std.time.timestamp();
+            const duration = now - metrics.start_time;
+            const rate = if (duration > 0) @as(f64, @floatFromInt(metrics.processed_count)) / @as(f64, @floatFromInt(duration)) else 0;
+
+            self.mutex.lock();
+            if (self.history.readableLength() >= 60) {
+                _ = self.history.readItem();
+            }
+            self.history.writeItem(.{ .ts = now, .rate = rate }) catch {};
+            self.mutex.unlock();
+        }
     }
 
     pub fn stop(self: *HttpServer) void {
@@ -34,6 +66,7 @@ pub const HttpServer = struct {
 
     pub fn deinit(self: *HttpServer) void {
         self.stop();
+        self.history.deinit();
         self.allocator.destroy(self);
     }
 
@@ -46,19 +79,40 @@ pub const HttpServer = struct {
             var conn = server.accept() catch continue;
             defer conn.stream.close();
 
-            var read_buffer: [1024 * 4]u8 = undefined;
+            var read_buffer: [1024 * 8]u8 = undefined;
             var server_http = http.Server.init(conn, &read_buffer);
             
             var request = server_http.receiveHead() catch continue;
             
             if (std.mem.eql(u8, request.head.target, "/api/metrics")) {
                 try handleMetrics(self, &request);
+            } else if (std.mem.eql(u8, request.head.target, "/api/history")) {
+                try handleHistory(self, &request);
             } else if (std.mem.eql(u8, request.head.target, "/") or std.mem.eql(u8, request.head.target, "/index.html")) {
                 try handleIndex(self, &request);
             } else {
                 try request.respond("", .{ .status = .not_found });
             }
         }
+    }
+
+    fn handleHistory(self: *HttpServer, request: *http.Server.Request) !void {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        try buf.append('[');
+        self.mutex.lock();
+        const items = self.history.readableSlice(0);
+        for (items, 0..) |item, i| {
+            try std.json.stringify(item, .{}, buf.writer());
+            if (i < items.len - 1) try buf.append(',');
+        }
+        self.mutex.unlock();
+        try buf.append(']');
+
+        try request.respond(buf.items, .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        });
     }
 
     fn handleMetrics(self: *HttpServer, request: *http.Server.Request) !void {
@@ -84,47 +138,33 @@ pub const HttpServer = struct {
 
     fn handleIndex(self: *HttpServer, request: *http.Server.Request) !void {
         _ = self;
-        // In a full implementation, we'd @embedFile("dashboard.html")
-        // For now, we'll serve a basic but beautiful HTML string
         const html = 
             \\<!DOCTYPE html>
             \\<html>
             \\<head>
-            \\  <title>zdze Dashboard</title>
+            \\  <title>zdze Elite Dashboard</title>
+            \\  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             \\  <style>
             \\    body { font-family: 'Inter', sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; }
-            \\    .container { max-width: 800px; margin: 0 auto; }
-            \\    .card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border-radius: 1rem; padding: 2rem; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+            \\    .container { max-width: 1000px; margin: 0 auto; }
+            \\    .card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border-radius: 1rem; padding: 2rem; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); margin-bottom: 2rem; }
             \\    h1 { margin-top: 0; background: linear-gradient(to right, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 2.5rem; }
-            \\    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 2rem; }
-            \\    .stat-item { background: rgba(15, 23, 42, 0.5); padding: 1.5rem; border-radius: 0.75rem; }
-            \\    .stat-label { color: #94a3b8; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; }
-            \\    .stat-value { font-size: 2rem; font-weight: bold; margin-top: 0.5rem; }
-            \\    .loading { color: #38bdf8; }
+            \\    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-top: 2rem; }
+            \\    .stat-item { background: rgba(15, 23, 42, 0.5); padding: 1.5rem; border-radius: 0.75rem; border: 1px solid rgba(255,255,255,0.05); }
+            \\    .stat-label { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+            \\    .stat-value { font-size: 1.5rem; font-weight: bold; }
+            \\    .chart-container { height: 300px; margin-top: 2rem; }
             \\  </style>
-            \\  <script>
-            \\    async function updateMetrics() {
-            \\      try {
-            \\        const res = await fetch('/api/metrics');
-            \\        const data = await res.json();
-            \\        document.getElementById('processed').innerText = data.processed_count.toLocaleString();
-            \\        document.getElementById('rate').innerText = data.rate.toFixed(2) + ' ev/s';
-            \\        document.getElementById('uptime').innerText = data.uptime_sec + 's';
-            \\      } catch (e) {
-            \\        console.error('Failed to fetch metrics', e);
-            \\      }
-            \\    }
-            \\    setInterval(updateMetrics, 1000);
-            \\  </script>
             \\</head>
             \\<body>
             \\  <div class="container">
             \\    <div class="card">
-            \\      <h1>zdze Control Center</h1>
-            \\      <p style="color: #94a3b8;">Real-time Pipeline Monitoring</p>
+            \\      <h1>zdze Elite Dashboard</h1>
+            \\      <p style="color: #94a3b8;">Real-time Pipeline Intelligence</p>
+            \\      
             \\      <div class="stats">
             \\        <div class="stat-item">
-            \\          <div class="stat-label">Processed Events</div>
+            \\          <div class="stat-label">Processed</div>
             \\          <div id="processed" class="stat-value">...</div>
             \\        </div>
             \\        <div class="stat-item">
@@ -136,12 +176,61 @@ pub const HttpServer = struct {
             \\          <div id="uptime" class="stat-value">...</div>
             \\        </div>
             \\        <div class="stat-item">
-            \\          <div class="stat-label">Status</div>
-            \\          <div class="stat-value" style="color: #4ade80;">Active</div>
+            \\          <div class="stat-label">Engine Status</div>
+            \\          <div class="stat-value" style="color: #4ade80;">Running</div>
             \\        </div>
+            \\      </div>
+            \\
+            \\      <div class="chart-container">
+            \\        <canvas id="myChart"></canvas>
             \\      </div>
             \\    </div>
             \\  </div>
+            \\
+            \\  <script>
+            \\    const ctx = document.getElementById('myChart').getContext('2d');
+            \\    const myChart = new Chart(ctx, {
+            \\      type: 'line',
+            \\      data: {
+            \\        labels: [],
+            \\        datasets: [{
+            \\          label: 'Events / Second',
+            \\          data: [],
+            \\          borderColor: '#38bdf8',
+            \\          backgroundColor: 'rgba(56, 189, 248, 0.1)',
+            \\          tension: 0.4,
+            \\          fill: true
+            \\        }]
+            \\      },
+            \\      options: {
+            \\        responsive: true,
+            \\        maintainAspectRatio: false,
+            \\        scales: {
+            \\          y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false } },
+            \\          x: { grid: { display: false }, border: { display: false } }
+            \\        },
+            \\        plugins: { legend: { display: false } }
+            \\      }
+            \\    });
+            \\
+            \\    async function updateDashboard() {
+            \\      try {
+            \\        const metricsRes = await fetch('/api/metrics');
+            \\        const metrics = await metricsRes.json();
+            \\        document.getElementById('processed').innerText = metrics.processed_count.toLocaleString();
+            \\        document.getElementById('rate').innerText = metrics.rate.toFixed(2) + ' ev/s';
+            \\        document.getElementById('uptime').innerText = metrics.uptime_sec + 's';
+            \\
+            \\        const historyRes = await fetch('/api/history');
+            \\        const history = await historyRes.json();
+            \\        
+            \\        myChart.data.labels = history.map(p => new Date(p.ts * 1000).toLocaleTimeString());
+            \\        myChart.data.datasets[0].data = history.map(p => p.rate);
+            \\        myChart.update('none');
+            \\      } catch (e) { console.error(e); }
+            \\    }
+            \\    setInterval(updateDashboard, 1000);
+            \\  </script>
             \\</body>
             \\</html>
         ;

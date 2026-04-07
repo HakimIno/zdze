@@ -453,6 +453,16 @@ pub const PostgresSource = struct {
                             try reader.discardAll(1); // Replica identity
                             const num_cols = try self.readInt(u16);
                             
+                            // Free old relation if it exists (Schema Drift)
+                            if (self.relations.fetchRemove(rel_id)) |entry| {
+                                self.allocator.free(entry.value.name);
+                                self.allocator.free(entry.value.schema);
+                                for (entry.value.columns) |col| {
+                                    self.allocator.free(col.name);
+                                }
+                                self.allocator.free(entry.value.columns);
+                            }
+
                             const columns = try self.allocator.alloc(types.Column, num_cols);
                             for (0..num_cols) |i| {
                                 try reader.discardAll(1); // Flags
@@ -468,6 +478,7 @@ pub const PostgresSource = struct {
                                 .schema = schema,
                                 .columns = columns,
                             });
+                            std.log.info("Schema Update: {s}.{s} (relid={d})", .{schema, name, rel_id});
                         },
                         .insert => {
                             const rel_id = try self.readInt(u32);

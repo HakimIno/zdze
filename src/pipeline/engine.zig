@@ -6,6 +6,7 @@ const filter = @import("filter.zig");
 const config = @import("../core/config.zig");
 const dispatcher = @import("dispatcher.zig");
 const dlq = @import("dlq.zig");
+const transformer = @import("transformer.zig");
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -14,6 +15,7 @@ pub const Engine = struct {
     dispatcher: ?*dispatcher.Dispatcher = null,
     dlq: ?*dlq.Dlq = null,
     filter: filter.Filter,
+    transformer: *transformer.Transformer,
     running: bool = false,
     
     metrics: struct {
@@ -22,14 +24,15 @@ pub const Engine = struct {
         start_time: i64 = 0,
     } = .{},
 
-    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, p_state: ?@import("../core/persistence.zig").Persistence, cfg: ?config.Config.FilterConfig) !*Engine {
+    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, p_state: ?@import("../core/persistence.zig").Persistence, cfg: config.Config) !*Engine {
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
             .source = source,
             .sink = sink,
             .dlq = dlq_ptr,
-            .filter = filter.Filter.init(cfg),
+            .filter = filter.Filter.init(cfg.filters),
+            .transformer = try transformer.Transformer.init(allocator, cfg.transformations),
         };
 
         // Initialize Dispatcher with persistence for transactional LSN
@@ -49,20 +52,23 @@ pub const Engine = struct {
             };
 
             if (event) |ev| {
-                if (self.filter.shouldPass(&ev)) {
+                var event_mut = ev;
+                if (self.filter.shouldPass(&event_mut)) {
+                    // Apply transformations
+                    try self.transformer.transform(&event_mut);
+
                     // Dispatch event asynchronously
                     if (self.dispatcher) |d| {
-                        try d.push(ev);
-                        // ev ownership transferred to dispatcher
+                        try d.push(event_mut);
+                        // event_mut ownership transferred to dispatcher
                     } else {
-                        var ev_copy = ev;
-                        try self.sink.emit(ev_copy);
-                        ev_copy.deinit(self.allocator);
+                        // If no dispatcher, emit directly and deinit
+                        try self.sink.emit(event_mut);
+                        event_mut.deinit(self.allocator);
                     }
                     self.metrics.processed_count += 1;
                 } else {
-                    var ev_mut = ev;
-                    ev_mut.deinit(self.allocator);
+                    event_mut.deinit(self.allocator);
                     self.metrics.skipped_count += 1;
                 }
                 
@@ -101,6 +107,7 @@ pub const Engine = struct {
             self.sink.deinit();
         }
         if (self.dlq) |d| d.deinit();
+        self.transformer.deinit();
         self.allocator.destroy(self);
     }
 };

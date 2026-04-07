@@ -7,6 +7,15 @@ pub const Config = struct {
     filters: ?FilterConfig = null,
     state_path: []const u8 = "zdze_state.bin",
     dlq_path: []const u8 = "zdze_dlq.jsonl",
+    transformations: ?[]TransformationConfig = null,
+
+    pub const TransformationAction = enum { mask, drop };
+
+    pub const TransformationConfig = struct {
+        table: []const u8,
+        column: []const u8,
+        action: TransformationAction,
+    };
 
     pub const FilterConfig = struct {
         include_tables: ?[][]const u8 = null,
@@ -54,7 +63,20 @@ pub const Config = struct {
             .filters = if (parsed.value.filters) |f| try dupeFilters(allocator, f) else null,
             .state_path = try allocator.dupe(u8, parsed.value.state_path),
             .dlq_path = try allocator.dupe(u8, parsed.value.dlq_path),
+            .transformations = if (parsed.value.transformations) |t| try dupeTransformations(allocator, t) else null,
         };
+    }
+
+    fn dupeTransformations(allocator: std.mem.Allocator, t: []const TransformationConfig) ![]TransformationConfig {
+        const result = try allocator.alloc(TransformationConfig, t.len);
+        for (t, 0..) |item, i| {
+            result[i] = .{
+                .table = try allocator.dupe(u8, item.table),
+                .column = try allocator.dupe(u8, item.column),
+                .action = item.action,
+            };
+        }
+        return result;
     }
 
     fn dupeFilters(allocator: std.mem.Allocator, f: FilterConfig) !FilterConfig {
@@ -125,6 +147,13 @@ pub const Config = struct {
                 for (et) |t| allocator.free(t);
                 allocator.free(et);
             }
+        }
+        if (self.transformations) |t| {
+            for (t) |item| {
+                allocator.free(item.table);
+                allocator.free(item.column);
+            }
+            allocator.free(t);
         }
     }
 };
