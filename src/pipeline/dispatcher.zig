@@ -2,10 +2,12 @@ const std = @import("std");
 const core = @import("../core/interface.zig");
 const types = @import("../core/types.zig");
 const core_err = @import("../core/error.zig");
+const dlq = @import("dlq.zig");
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
     sink: core.Sink,
+    dlq: ?*dlq.Dlq = null,
     queue: std.fifo.LinearFifo(types.CdcEvent, .Dynamic),
     mutex: std.Thread.Mutex = .{},
     not_empty: std.Thread.Condition = .{},
@@ -14,11 +16,12 @@ pub const Dispatcher = struct {
     running: bool = false,
     thread: ?std.Thread = null,
 
-    pub fn init(allocator: std.mem.Allocator, sink: core.Sink, max_size: usize) !*Dispatcher {
+    pub fn init(allocator: std.mem.Allocator, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, max_size: usize) !*Dispatcher {
         const self = try allocator.create(Dispatcher);
         self.* = .{
             .allocator = allocator,
             .sink = sink,
+            .dlq = dlq_ptr,
             .queue = std.fifo.LinearFifo(types.CdcEvent, .Dynamic).init(allocator),
             .max_size = max_size,
         };
@@ -84,6 +87,11 @@ pub const Dispatcher = struct {
             // Emit event to sink
             self.sink.emit(event) catch |err| {
                 std.log.err("Dispatcher: Sink emit error: {s}", .{@errorName(err)});
+                if (self.dlq) |d| {
+                    d.save(event, @errorName(err)) catch |dlq_err| {
+                        std.log.err("Dispatcher: Failed to save to DLQ: {s}", .{@errorName(dlq_err)});
+                    };
+                }
             };
 
             // Cleanup event after emission
@@ -121,7 +129,7 @@ const MockSink = struct {
 test "Dispatcher: basic processing" {
     const allocator = std.testing.allocator;
     var mock = MockSink{};
-    const d = try Dispatcher.init(allocator, mock.sink(), 100);
+    const d = try Dispatcher.init(allocator, mock.sink(), null, 100);
     defer d.deinit();
 
     try d.start();
@@ -149,7 +157,7 @@ test "Dispatcher: basic processing" {
 test "Dispatcher: backpressure" {
     const allocator = std.testing.allocator;
     var mock = MockSink{ .delay_ms = 50 }; // Slow sink
-    const d = try Dispatcher.init(allocator, mock.sink(), 2); // Small queue
+    const d = try Dispatcher.init(allocator, mock.sink(), null, 2); // Small queue
     defer d.deinit();
 
     try d.start();

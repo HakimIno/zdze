@@ -5,12 +5,14 @@ const core_err = @import("../core/error.zig");
 const filter = @import("filter.zig");
 const config = @import("../core/config.zig");
 const dispatcher = @import("dispatcher.zig");
+const dlq = @import("dlq.zig");
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     source: core.Source,
     sink: core.Sink,
     dispatcher: ?*dispatcher.Dispatcher = null,
+    dlq: ?*dlq.Dlq = null,
     filter: filter.Filter,
     running: bool = false,
     
@@ -20,17 +22,18 @@ pub const Engine = struct {
         start_time: i64 = 0,
     } = .{},
 
-    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, cfg: ?config.Config.FilterConfig) !*Engine {
+    pub fn init(allocator: std.mem.Allocator, source: core.Source, sink: core.Sink, dlq_ptr: ?*dlq.Dlq, cfg: ?config.Config.FilterConfig) !*Engine {
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
             .source = source,
             .sink = sink,
+            .dlq = dlq_ptr,
             .filter = filter.Filter.init(cfg),
         };
 
         // Initialize Dispatcher (default max_size 10,000)
-        self.dispatcher = try dispatcher.Dispatcher.init(allocator, sink, 10000);
+        self.dispatcher = try dispatcher.Dispatcher.init(allocator, sink, dlq_ptr, 10000);
         return self;
     }
 
@@ -97,6 +100,7 @@ pub const Engine = struct {
         } else {
             self.sink.deinit();
         }
+        if (self.dlq) |d| d.deinit();
         self.allocator.destroy(self);
     }
 };

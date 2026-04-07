@@ -1,25 +1,37 @@
 const std = @import("std");
 const root = @import("root.zig");
+const http = @import("core/http_server.zig");
+const dlq = @import("pipeline/dlq.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "init")) {
+        try handleInit();
+        return;
+    }
+
     std.log.info("Starting zdze CDC Engine...", .{});
 
     // 1. Load Configuration
     const config_path = "config.json";
     const cfg = root.core.config.Config.load(allocator, config_path) catch |err| {
-        std.log.err("Failed to load config from {s}: {s}. Using internal defaults...", .{config_path, @errorName(err)});
-        // Mock default for demonstration if file missing
+        std.log.err("Failed to load config from {s}: {s}.", .{config_path, @errorName(err)});
         return err; 
     };
     defer cfg.deinit(allocator);
 
-    // 2. Setup Persistence
+    // 2. Setup Persistence & DLQ
     var persistence = try root.core.persistence.Persistence.init(allocator, cfg.state_path);
     defer persistence.deinit();
+
+    var dlq_ptr = try dlq.Dlq.init(allocator, cfg.dlq_path);
+    defer dlq_ptr.deinit();
 
     // 3. Initialize Source
     var source_ptr: root.core.interface.Source = undefined;
@@ -67,20 +79,26 @@ pub fn main() !void {
             }
         },
     }
-    defer sink_ptr.deinit();
+    // Note: Sink lifecycle is managed by Engine (via Dispatcher) or manually if engine fails/stops early
 
-    // 5. Setup Engine & Run
+    // 5. Setup Engine
     const engine = try root.pipeline.engine.Engine.init(
         allocator,
         source_ptr,
         sink_ptr,
+        dlq_ptr,
         cfg.filters,
     );
     defer engine.deinit();
 
     engine.metrics.start_time = std.time.timestamp();
     
-    // 6. Signal Handling for Graceful Shutdown
+    // 6. Setup HTTP Dashboard
+    var server = try http.HttpServer.init(allocator, engine, 8080);
+    defer server.deinit();
+    try server.start();
+
+    // 7. Signal Handling
     _engine_ptr = engine;
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handleSigInt },
@@ -92,6 +110,32 @@ pub fn main() !void {
 
     std.log.info("Engine components initialized. Starting replication loop...", .{});
     try engine.run();
+}
+
+fn handleInit() !void {
+    std.log.info("Auto-discovering Postgres configuration...", .{});
+    // Simplified stub for auto-discovery
+    const default_config = 
+        \\{
+        \\  "source": {
+        \\    "type": "postgres",
+        \\    "postgres": {
+        \\      "host": "localhost",
+        \\      "port": 5432,
+        \\      "user": "postgres",
+        \\      "database": "zdze_db",
+        \\      "ssl": false
+        \\    }
+        \\  },
+        \\  "sink": {
+        \\    "type": "stdout"
+        \\  }
+        \\}
+    ;
+    const file = try std.fs.cwd().createFile("config.json", .{});
+    defer file.close();
+    try file.writeAll(default_config);
+    std.log.info("Created default config.json. Edit it and run 'zdze' to start.", .{});
 }
 
 var _engine_ptr: ?*root.pipeline.engine.Engine = null;

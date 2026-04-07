@@ -6,6 +6,7 @@ pub const Config = struct {
     sink: SinkConfig,
     filters: ?FilterConfig = null,
     state_path: []const u8 = "zdze_state.bin",
+    dlq_path: []const u8 = "zdze_dlq.jsonl",
 
     pub const FilterConfig = struct {
         include_tables: ?[][]const u8 = null,
@@ -52,6 +53,7 @@ pub const Config = struct {
             },
             .filters = if (parsed.value.filters) |f| try dupeFilters(allocator, f) else null,
             .state_path = try allocator.dupe(u8, parsed.value.state_path),
+            .dlq_path = try allocator.dupe(u8, parsed.value.dlq_path),
         };
     }
 
@@ -90,6 +92,7 @@ pub const Config = struct {
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.state_path);
+        allocator.free(self.dlq_path);
         if (self.sink.webhook_url) |url| allocator.free(url);
         if (self.sink.kafka_brokers) |kb| allocator.free(kb);
         if (self.sink.kafka_topic) |kt| allocator.free(kt);
